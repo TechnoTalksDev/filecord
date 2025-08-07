@@ -53,6 +53,12 @@ class VideoProcessor:
         self.target_size_mb = 10
         self.available_encoders: List[EncoderConfig] = []
         self.preferred_encoder: Optional[EncoderConfig] = None
+        
+        # Optimization settings
+        self.optimization_timeout_base = 180  # Base timeout in seconds
+        self.max_optimization_attempts = 3
+        self.size_tolerance = 1.1  # Accept files up to 10% over target
+        
         self._verify_ffmpeg()
         self._detect_hardware_encoders()
     
@@ -466,7 +472,7 @@ class VideoProcessor:
                         raise e
             
             # Step 4: Verify output size and optimize if needed
-            yield {"progress": 95, "message": "Finalizing..."}
+            yield {"progress": 95, "message": "Checking file size..."}
             
             # Restore original encoder if we switched to fallback
             if fallback_attempted and 'original_encoder' in locals():
@@ -476,10 +482,17 @@ class VideoProcessor:
             output_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
             logger.info(f"Job {job_id}: Output file size: {output_size:.2f}MB")
             
-            if output_size > target_size_mb * 1.1:  # 10% tolerance
-                logger.info(f"Job {job_id}: File too large, optimizing...")
-                yield {"progress": 97, "message": "Optimizing file size..."}
-                await self._optimize_size(input_path, output_path, target_size_mb, duration)
+            if output_size > target_size_mb * self.size_tolerance:  # Configurable tolerance
+                logger.info(f"Job {job_id}: File too large ({output_size:.2f}MB > {target_size_mb * self.size_tolerance:.2f}MB), optimizing...")
+                
+                # Run progressive optimization with progress updates
+                # Use output_path as input for optimization (optimize the already-converted file)
+                async for opt_progress in self._optimize_size(output_path, output_path, target_size_mb, duration):
+                    yield opt_progress
+                
+                # Get final size after optimization
+                final_size = os.path.getsize(output_path) / (1024 * 1024)
+                logger.info(f"Job {job_id}: Final size after optimization: {final_size:.2f}MB")
             
             yield {
                 "progress": 100, 
@@ -605,10 +618,16 @@ class VideoProcessor:
             width, height = 1280, 720
             print(f"Warning: Could not determine video dimensions, using default {width}x{height}")
         
-        # Calculate target bitrate (reserve 128kbps for audio)
+        # Calculate target bitrate using proper formula
+        # Based on: bitrate = (target_size_MB * 8192) / duration_seconds
+        total_bitrate_kbps = (target_size_mb * 8192) / duration
+        
+        # Use a reasonable default for audio in initial conversion
+        audio_bitrate_kbps = 96  # Will be detected later during optimization
+        
         target_bitrate_kbps = max(
-            100,  # Minimum bitrate
-            int((target_size_mb * 8192) / duration) - 128  # Target bitrate minus audio
+            100,  # Minimum for very compressed video (lowered from 200)
+            int(total_bitrate_kbps - audio_bitrate_kbps)  # Video bitrate after audio
         )
         
         # Determine output resolution
@@ -645,6 +664,30 @@ class VideoProcessor:
         else:
             # Keep original resolution if already small
             return width, height
+    
+    def _get_audio_bitrate(self, input_path: str) -> float:
+        """Detect the actual audio bitrate from the source file"""
+        try:
+            # Use ffprobe to get audio stream information
+            result = subprocess.run([
+                'ffprobe', '-v', 'quiet', '-select_streams', 'a:0',
+                '-show_entries', 'stream=bit_rate', '-of', 'csv=p=0',
+                input_path
+            ], capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                # Convert bits per second to kbps
+                audio_bitrate_bps = int(result.stdout.strip())
+                audio_bitrate_kbps = audio_bitrate_bps / 1000
+                logger.debug(f"Detected audio bitrate: {audio_bitrate_kbps:.1f}k")
+                return audio_bitrate_kbps
+                
+        except (subprocess.SubprocessError, ValueError, subprocess.TimeoutExpired) as e:
+            logger.warning(f"Could not detect audio bitrate: {e}")
+        
+        # Fallback to reasonable default
+        logger.debug("Using default audio bitrate: 96k")
+        return 96.0  # Reasonable default for compressed audio
     
     async def _convert_with_progress(
         self, 
@@ -836,69 +879,177 @@ class VideoProcessor:
         output_path: str, 
         target_size_mb: int, 
         duration: float
-    ):
-        """Optimize file size if initial conversion exceeds target using hardware acceleration"""
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Optimize file size if initial conversion exceeds target using progressive optimization with timeouts"""
         
-        logger.info("Starting size optimization with hardware acceleration...")
+        logger.info("Starting progressive size optimization...")
         
-        # Try with lower bitrate (80% of original target)
-        lower_bitrate = max(50, int((target_size_mb * 8192 * 0.8) / duration) - 128)
+        # Progressive optimization attempts with decreasing bitrates and timeouts
+        optimization_attempts = [
+            {
+                'bitrate_factor': 0.80, 
+                'timeout': self.optimization_timeout_base, 
+                'name': 'conservative'
+            },
+            {
+                'bitrate_factor': 0.65, 
+                'timeout': self.optimization_timeout_base + 60, 
+                'name': 'moderate'
+            },
+            {
+                'bitrate_factor': 0.50, 
+                'timeout': self.optimization_timeout_base + 120, 
+                'name': 'aggressive'
+            }
+        ][:self.max_optimization_attempts]  # Limit to configured max attempts
         
-        temp_output = f"{output_path}_temp.mp4"
+        original_size = os.path.getsize(output_path) / (1024 * 1024)
         
-        # Use hardware encoder for optimization too
+        for attempt_num, attempt in enumerate(optimization_attempts, 1):
+            # Calculate target bitrate for this attempt using proper formula
+            # Based on: bitrate = (target_size_MB * 8192) / duration_seconds
+            total_bitrate_kbps = (target_size_mb * 8192) / duration
+            
+            # Detect actual audio bitrate from the source file
+            audio_bitrate_kbps = self._get_audio_bitrate(input_path)
+            
+            # Calculate video bitrate (ensure we don't go negative)
+            base_video_bitrate = max(200, total_bitrate_kbps - audio_bitrate_kbps)
+            
+            # Apply the attempt factor (progressive reduction for multiple attempts)
+            target_bitrate = max(100, int(base_video_bitrate * attempt['bitrate_factor']))
+            temp_output = f"{output_path}_temp_opt{attempt_num}.mp4"
+            
+            logger.info(f"Optimization attempt {attempt_num}/{len(optimization_attempts)}: {attempt['name']} "
+                       f"(total: {total_bitrate_kbps:.1f}k, audio: {audio_bitrate_kbps:.1f}k, "
+                       f"video: {target_bitrate}k, timeout: {attempt['timeout']}s)")
+            
+            yield {
+                "progress": 96 + attempt_num,
+                "message": f"Optimizing size (attempt {attempt_num}/{len(optimization_attempts)})..."
+            }
+            
+            try:
+                # Build fast optimization command
+                cmd = self._build_fast_optimization_command(input_path, temp_output, target_bitrate)
+                
+                # Run optimization with timeout and progress tracking
+                success = await self._run_optimization_with_timeout(
+                    cmd, temp_output, output_path, attempt['timeout']
+                )
+                
+                if success:
+                    new_size = os.path.getsize(output_path) / (1024 * 1024)
+                    reduction = ((original_size - new_size) / original_size) * 100
+                    
+                    logger.info(f"Optimization successful! Size reduced from {original_size:.2f}MB to "
+                              f"{new_size:.2f}MB ({reduction:.1f}% reduction)")
+                    
+                    # Check if we've reached target size
+                    if new_size <= target_size_mb * 1.05:  # 5% tolerance
+                        logger.info(f"Target size achieved in attempt {attempt_num}")
+                        return
+                    elif attempt_num < len(optimization_attempts):
+                        logger.info(f"Size still above target, trying next optimization level...")
+                        continue
+                    else:
+                        logger.info(f"Final optimization complete. Size: {new_size:.2f}MB")
+                        return
+                        
+            except asyncio.TimeoutError:
+                logger.warning(f"Optimization attempt {attempt_num} timed out after {attempt['timeout']}s")
+                self._cleanup_temp_file(temp_output)
+                
+                if attempt_num < len(optimization_attempts):
+                    logger.info("Trying next optimization level...")
+                    continue
+                else:
+                    logger.warning("All optimization attempts timed out, keeping original conversion")
+                    return
+                    
+            except Exception as e:
+                logger.error(f"Optimization attempt {attempt_num} failed: {str(e)}")
+                self._cleanup_temp_file(temp_output)
+                
+                if attempt_num < len(optimization_attempts):
+                    logger.info("Trying next optimization level...")
+                    continue
+                else:
+                    logger.warning("All optimization attempts failed, keeping original conversion")
+                    return
+        
+        logger.info("Size optimization process completed")
+    
+    def _build_fast_optimization_command(self, input_path: str, output_path: str, target_bitrate: int) -> List[str]:
+        """Build FFmpeg command optimized for speed during size optimization"""
         cmd = ['ffmpeg', '-i', input_path]
         
-        if self.preferred_encoder and self.preferred_encoder.type == EncoderType.NVENC:
-            cmd.extend([
-                '-c:v', self.preferred_encoder.h264_encoder,
-                '-preset', 'slow',  # Better compression for NVENC
-                '-rc', 'vbr_hq',
-                '-b:v', f"{lower_bitrate}k",
-                '-maxrate', f"{int(lower_bitrate * 1.2)}k",
-                '-bufsize', f"{int(lower_bitrate * 2)}k",
-                '-spatial_aq', '1',
-                '-temporal_aq', '1'
-            ])
-        elif self.preferred_encoder and self.preferred_encoder.type == EncoderType.QSV:
-            cmd.extend([
-                '-c:v', self.preferred_encoder.h264_encoder,
-                '-preset', 'slow',
-                '-global_quality', '26',  # Higher quality for better compression
-                '-b:v', f"{lower_bitrate}k",
-                '-maxrate', f"{int(lower_bitrate * 1.1)}k"
-            ])
-        elif self.preferred_encoder and self.preferred_encoder.type == EncoderType.AMF:
-            cmd.extend([
-                '-c:v', self.preferred_encoder.h264_encoder,
-                '-quality', 'quality',  # Better quality mode
-                '-rc', 'vbr_peak',
-                '-b:v', f"{lower_bitrate}k",
-                '-qmin', '20',
-                '-qmax', '30'
-            ])
-        else:  # SOFTWARE fallback
+        if not self.preferred_encoder:
+            # Software fallback
             cmd.extend([
                 '-c:v', 'libx264',
-                '-preset', 'slower',  # Better compression
-                '-b:v', f"{lower_bitrate}k"
+                '-preset', 'veryfast',  # Fast preset for optimization
+                '-b:v', f"{target_bitrate}k"
+            ])
+        elif self.preferred_encoder.type == EncoderType.NVENC:
+            # Fast NVENC settings optimized for speed
+            cmd.extend([
+                '-c:v', self.preferred_encoder.h264_encoder,
+                '-preset', 'fast',  # Fast preset instead of slow
+                '-rc', 'cbr',       # Simple rate control for speed
+                '-b:v', f"{target_bitrate}k",
+                '-maxrate', f"{target_bitrate}k",
+                '-bufsize', f"{int(target_bitrate * 1.5)}k"
+            ])
+        elif self.preferred_encoder.type == EncoderType.QSV:
+            cmd.extend([
+                '-c:v', self.preferred_encoder.h264_encoder,
+                '-preset', 'fast',
+                '-b:v', f"{target_bitrate}k",
+                '-maxrate', f"{int(target_bitrate * 1.1)}k"
+            ])
+        elif self.preferred_encoder.type == EncoderType.AMF:
+            cmd.extend([
+                '-c:v', self.preferred_encoder.h264_encoder,
+                '-quality', 'speed',  # Speed-optimized mode
+                '-rc', 'cbr',
+                '-b:v', f"{target_bitrate}k"
+            ])
+        else:  # VAAPI or other
+            cmd.extend([
+                '-c:v', self.preferred_encoder.h264_encoder,
+                '-b:v', f"{target_bitrate}k"
             ])
         
+        # Common output settings optimized for speed
         cmd.extend([
             '-c:a', 'aac',
-            '-b:a', '96k',  # Lower audio bitrate
+            '-b:a', '96k',
             '-movflags', '+faststart',
+            '-threads', '4',  # Limit threads for better predictability
             '-y',
-            temp_output
+            '-progress', 'pipe:2',
+            output_path
         ])
         
-        logger.info(f"Optimization command: {' '.join(cmd)}")
+        return cmd
+    
+    async def _run_optimization_with_timeout(
+        self, 
+        cmd: List[str], 
+        temp_output: str, 
+        final_output: str, 
+        timeout_seconds: int
+    ) -> bool:
+        """Run optimization command with timeout and error handling"""
         
-        # Use threading approach like in _convert_with_progress
+        logger.info(f"Running optimization with {timeout_seconds}s timeout: {' '.join(cmd[:8])}...")
+        
         import threading
         import queue
         
         progress_queue = queue.Queue()
+        stderr_lines = []
         
         def run_optimization():
             try:
@@ -906,52 +1057,97 @@ class VideoProcessor:
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    universal_newlines=True
+                    universal_newlines=True,
+                    bufsize=1,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
                 )
                 
-                stdout, stderr = process.communicate()
-                progress_queue.put(('done', process.returncode, stderr))
+                # Read stderr for progress monitoring
+                while True:
+                    line = process.stderr.readline()
+                    if not line:
+                        break
+                    stderr_lines.append(line.strip())
+                    progress_queue.put(('progress', line.strip()))
+                
+                process.wait()
+                progress_queue.put(('done', process.returncode))
                 
             except Exception as e:
+                logger.error(f"Optimization thread error: {str(e)}")
                 progress_queue.put(('error', str(e)))
         
+        # Start optimization in separate thread
         optimization_thread = threading.Thread(target=run_optimization)
         optimization_thread.start()
         
+        start_time = asyncio.get_event_loop().time()
+        
         try:
             while True:
+                current_time = asyncio.get_event_loop().time()
+                elapsed = current_time - start_time
+                
+                # Check for timeout
+                if elapsed > timeout_seconds:
+                    logger.warning(f"Optimization timed out after {elapsed:.1f}s")
+                    raise asyncio.TimeoutError(f"Optimization exceeded {timeout_seconds}s timeout")
+                
                 try:
-                    msg_type, *data = progress_queue.get(timeout=0.1)
+                    msg_type, data = progress_queue.get(timeout=0.5)
                     
                     if msg_type == 'done':
-                        returncode, stderr = data
+                        returncode = data
                         if returncode != 0:
+                            stderr_text = '\n'.join(stderr_lines[-10:])  # Last 10 lines
                             logger.error(f"Optimization failed with code {returncode}")
-                            logger.error(f"Stderr: {stderr}")
-                            raise Exception(f"Size optimization failed: {stderr}")
+                            logger.error(f"Error output: {stderr_text}")
+                            
+                            # Check for hardware encoder failure
+                            if self._is_hardware_encoder_failure(stderr_text):
+                                logger.warning("Hardware encoder failed during optimization, this attempt failed")
+                                return False
+                            else:
+                                raise Exception(f"Optimization failed: {stderr_text}")
                         
-                        # Replace original with optimized version
-                        os.replace(temp_output, output_path)
-                        logger.info("Size optimization completed successfully")
-                        break
+                        # Success - replace original with optimized version
+                        if os.path.exists(temp_output):
+                            os.replace(temp_output, final_output)
+                            logger.info("Optimization completed successfully")
+                            return True
+                        else:
+                            logger.error("Optimization output file not found")
+                            return False
                     
                     elif msg_type == 'error':
-                        raise Exception(f"Optimization error: {data[0]}")
-                        
+                        raise Exception(f"Optimization error: {data}")
+                    
+                    elif msg_type == 'progress':
+                        # Log progress occasionally for debugging
+                        if 'frame=' in data and elapsed > 30 and int(elapsed) % 30 == 0:
+                            logger.debug(f"Optimization progress at {elapsed:.0f}s: {data}")
+                
                 except queue.Empty:
                     await asyncio.sleep(0.1)
                     continue
                 
         finally:
-            optimization_thread.join(timeout=30)
-            # Clean up temp file if it exists
-            if os.path.exists(temp_output):
-                try:
-                    os.remove(temp_output)
-                except:
-                    pass
-        
-        logger.info(f"Final output size after optimization: {os.path.getsize(output_path) / (1024 * 1024):.2f}MB")
+            # Clean up thread
+            optimization_thread.join(timeout=5)
+            if optimization_thread.is_alive():
+                logger.warning("Optimization thread did not terminate cleanly")
+            
+            # Clean up temp file
+            self._cleanup_temp_file(temp_output)
+    
+    def _cleanup_temp_file(self, temp_path: str):
+        """Safely clean up temporary optimization file"""
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                logger.debug(f"Cleaned up temporary file: {temp_path}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up temporary file {temp_path}: {e}")
     
     def refresh_encoder_detection(self):
         """Re-detect available encoders (useful after driver updates or hardware changes)"""
@@ -960,6 +1156,19 @@ class VideoProcessor:
         self.preferred_encoder = None
         self._detect_hardware_encoders()
         logger.info("Encoder detection refreshed")
+    
+    def configure_optimization(self, timeout_base: int = 180, max_attempts: int = 3, size_tolerance: float = 1.1):
+        """Configure optimization behavior
+        
+        Args:
+            timeout_base: Base timeout in seconds for optimization attempts
+            max_attempts: Maximum number of optimization attempts
+            size_tolerance: Accept files up to this factor over target size (1.1 = 10% tolerance)
+        """
+        self.optimization_timeout_base = timeout_base
+        self.max_optimization_attempts = max_attempts
+        self.size_tolerance = size_tolerance
+        logger.info(f"Optimization configured: timeout_base={timeout_base}s, max_attempts={max_attempts}, tolerance={size_tolerance}")
     
     def get_encoder_status(self) -> Dict[str, Any]:
         """Get current encoder status and available options"""

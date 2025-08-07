@@ -155,7 +155,11 @@ class FileCordApp {
         
         switch (data.status) {
             case 'queued':
-                this.updateProgress(0, 'Video queued for processing...');
+                let queueMessage = 'Video queued for processing...';
+                if (data.queue_position && data.queue_size) {
+                    queueMessage = `Position ${data.queue_position} of ${data.queue_size} in queue`;
+                }
+                this.updateProgress(0, queueMessage);
                 break;
                 
             case 'processing':

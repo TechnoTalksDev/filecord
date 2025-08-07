@@ -19,6 +19,8 @@ class ConversionJob(BaseModel):
     message: str = ""
     error: Optional[str] = None
     created_at: datetime
+    queue_position: Optional[int] = None
+    queue_size: Optional[int] = None
 
 class ProgressUpdate(BaseModel):
     progress: int
@@ -37,3 +39,5 @@ class StatusResponse(BaseModel):
     message: str
     error: Optional[str] = None
     created_at: str
+    queue_position: Optional[int] = None
+    queue_size: Optional[int] = None

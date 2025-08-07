@@ -2,3 +2,4 @@ outputs
 uploads
 __pycache__
 .venv
+OPTIMIZATION_IMPROVEMENTS.md
