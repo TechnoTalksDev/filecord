@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FileCord - Video Converter</title>
+    <meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
+    <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>FileCord</h1>
+            <p>Convert any video to 10MB</p>
+            <p>Discord's free file limit</p>
+        </header>
+
+        <main id="app">
+            <!-- Initial State -->
+            <div id="upload-area" class="upload-area">
+                <div class="upload-content">
+                    <div class="upload-icon">📁</div>
+                    <h2>Drop video file here or click to select</h2>
+                    <p>Any format • Maximum output: 10MB</p>
+                    <input type="file" id="file-input" accept="video/*" hidden>
+                </div>
+            </div>
+
+            <!-- Loading State -->
+            <div id="loading-area" class="loading-area hidden">
+                <div class="loading-content">
+                    <div class="spinner"></div>
+                    <h2 id="loading-text">Loading FFmpeg...</h2>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <p id="progress-text">0%</p>
+                </div>
+            </div>
+
+            <!-- Success State -->
+            <div id="success-area" class="success-area hidden">
+                <div class="success-content">
+                    <div class="success-icon">✅</div>
+                    <h2>Conversion Complete!</h2>
+                    <p id="file-info">Your video has been converted</p>
+                    <button id="download-btn" class="download-btn">Download Video</button>
+                    <button id="reset-btn" class="reset-btn">Convert Another</button>
+                </div>
+            </div>
+
+            <!-- Error State -->
+            <div id="error-area" class="error-area hidden">
+                <div class="error-content">
+                    <div class="error-icon">❌</div>
+                    <h2>Conversion Failed</h2>
+                    <p id="error-message">Something went wrong</p>
+                    <button id="retry-btn" class="retry-btn">Try Again</button>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script type="module" src="script.js"></script>
+</body>
+</html>

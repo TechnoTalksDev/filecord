@@ -1,0 +1,13 @@
+[project]
+name = "filecord-backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiofiles>=24.1.0",
+    "fastapi>=0.116.1",
+    "ffmpeg-python>=0.2.0",
+    "python-multipart>=0.0.20",
+    "uvicorn>=0.35.0",
+]
